@@ -1,8 +1,12 @@
 import logging
+import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import config
 import db
 from handlers import (
+    backup_command,
     bank_command,
     help_command,
     jugar_command,
@@ -31,6 +35,25 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, *args):
+        pass
+
+
+def _start_health_server():
+    port = int(os.environ.get("PORT", 8000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    logger.info("Servidor de salud en el puerto %s", port)
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Excepción no controlada:", exc_info=context.error)
 
@@ -41,6 +64,7 @@ MENU_COMMANDS = [
     BotCommand("stake", "Ver apuesta recomendada"),
     BotCommand("bank", "Registrar tu bank (ej. /bank 100000)"),
     BotCommand("stats", "Ver tus estadísticas"),
+    BotCommand("backup", "Descargar copia de la base de datos"),
     BotCommand("reset", "Borrar historial"),
     BotCommand("help", "Ayuda"),
 ]
@@ -52,6 +76,7 @@ async def post_init(app):
 
 def main():
     db.init_db()
+    _start_health_server()
     app = (
         Application.builder()
         .token(config.TOKEN)
@@ -66,6 +91,7 @@ def main():
     app.add_handler(CommandHandler("simular", simular_command))
     app.add_handler(CommandHandler("stake", stake_command))
     app.add_handler(CommandHandler("bank", bank_command))
+    app.add_handler(CommandHandler("backup", backup_command))
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(CallbackQueryHandler(on_callback))

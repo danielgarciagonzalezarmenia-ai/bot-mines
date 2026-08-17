@@ -1,3 +1,5 @@
+import os
+
 import db
 import signals
 import simulate
@@ -232,6 +234,17 @@ async def bank_command(update, context):
         f"🏦 ¿Cuánto tienes de bank en pesos? (mín ${stake.MIN_BET:,} COP, ej: 100000)",
         reply_markup=_main_menu_keyboard(),
     )
+
+
+async def backup_command(update, context):
+    if not os.path.exists(db.DB_PATH):
+        await update.message.reply_text("Aún no hay base de datos guardada.")
+        return
+    with open(db.DB_PATH, "rb") as f:
+        await update.message.reply_document(
+            document=(f"bot_{update.effective_user.id}.db", f),
+            caption="💾 Copia de seguridad de la base de datos.",
+        )
 
 
 async def text_handler(update, context):
