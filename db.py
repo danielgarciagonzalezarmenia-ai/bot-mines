@@ -1,7 +1,9 @@
 import json
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
+
+SESSION_TIMEOUT = timedelta(minutes=7)
 
 DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(DATA_DIR, "bot.db")
@@ -92,6 +94,18 @@ def init_db():
                     user_id INTEGER PRIMARY KEY,
                     bank INTEGER NOT NULL,
                     updated_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_state (
+                    user_id INTEGER PRIMARY KEY,
+                    last_activity TEXT,
+                    session_start TEXT,
+                    mode TEXT DEFAULT 'normal',
+                    meta_bank INTEGER,
+                    meta_target INTEGER
                 )
                 """
             )
@@ -306,6 +320,104 @@ def get_results(user_id):
         conn.close()
 
 
+def get_results_since(user_id, since_iso):
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            "SELECT result FROM games "
+            "WHERE user_id=? AND result IN ('won','lost') AND created_at >= ? "
+            "ORDER BY id ASC",
+            (user_id, since_iso),
+        ).fetchall()
+        return [r["result"] for r in rows]
+    finally:
+        conn.close()
+
+
+def update_activity(user_id):
+    now = datetime.utcnow()
+    now_iso = now.isoformat()
+    conn = _conn()
+    try:
+        with conn:
+            row = conn.execute(
+                "SELECT last_activity, session_start FROM user_state WHERE user_id=?",
+                (user_id,),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO user_state (user_id, last_activity, session_start, mode) "
+                    "VALUES (?,?,?,'normal')",
+                    (user_id, now_iso, now_iso),
+                )
+                return True, now_iso
+            last = datetime.fromisoformat(row["last_activity"])
+            if now - last > SESSION_TIMEOUT:
+                conn.execute(
+                    "UPDATE user_state SET last_activity=?, session_start=? WHERE user_id=?",
+                    (now_iso, now_iso, user_id),
+                )
+                return True, now_iso
+            conn.execute(
+                "UPDATE user_state SET last_activity=? WHERE user_id=?",
+                (now_iso, user_id),
+            )
+            return False, row["session_start"]
+    finally:
+        conn.close()
+
+
+def get_user_state(user_id):
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT mode, meta_bank, meta_target, session_start FROM user_state WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        if row:
+            return {
+                "mode": row["mode"],
+                "meta_bank": row["meta_bank"],
+                "meta_target": row["meta_target"],
+                "session_start": row["session_start"],
+            }
+        return {"mode": "normal", "meta_bank": None, "meta_target": None, "session_start": None}
+    finally:
+        conn.close()
+
+
+def set_meta(user_id, meta_bank, meta_target):
+    now_iso = datetime.utcnow().isoformat()
+    conn = _conn()
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO user_state (user_id, last_activity, session_start, mode, meta_bank, meta_target)
+                VALUES (?,?,?,'meta',?,?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    mode = 'meta',
+                    meta_bank = excluded.meta_bank,
+                    meta_target = excluded.meta_target
+                """,
+                (user_id, now_iso, now_iso, meta_bank, meta_target),
+            )
+    finally:
+        conn.close()
+
+
+def clear_meta(user_id):
+    conn = _conn()
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE user_state SET mode='normal', meta_bank=NULL, meta_target=NULL WHERE user_id=?",
+                (user_id,),
+            )
+    finally:
+        conn.close()
+
+
 def get_bank(user_id):
     conn = _conn()
     try:
@@ -355,7 +467,7 @@ def reset_user(user_id):
     conn = _conn()
     try:
         with conn:
-            for table in ("cells", "games", "risk_stats", "mine_log", "safe_log", "bank", "stats"):
+            for table in ("cells", "games", "risk_stats", "mine_log", "safe_log", "bank", "user_state", "stats"):
                 conn.execute(
                     f"DELETE FROM {table} WHERE user_id=?", (user_id,)
                 )

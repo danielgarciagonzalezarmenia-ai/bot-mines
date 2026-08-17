@@ -7,14 +7,17 @@ import stake
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import ContextTypes
 
-MENU_BUTTONS = ["🎮 Jugar", "🔬 Simular", "📊 Stats", "🧹 Reset", "🆘 Ayuda", "💰 Stake", "🏦 Bank"]
+MENU_BUTTONS = ["🎮 Jugar", "🎯 Meta", "🔬 Simular", "📊 Stats", "🧹 Reset", "🆘 Ayuda", "💰 Stake", "🏦 Bank"]
 BANK_AWAITING = set()
+META_AWAITING_BANK = set()
+META_AWAITING_TARGET = set()
+META_BANK_TMP = {}
 
 
 def _main_menu_keyboard():
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("🎮 Jugar"), KeyboardButton("🔬 Simular")],
+            [KeyboardButton("🎮 Jugar"), KeyboardButton("🎯 Meta"), KeyboardButton("🔬 Simular")],
             [KeyboardButton("💰 Stake"), KeyboardButton("🏦 Bank")],
             [KeyboardButton("📊 Stats"), KeyboardButton("🧹 Reset"), KeyboardButton("🆘 Ayuda")],
         ],
@@ -111,6 +114,12 @@ async def help_command(update, context):
 
 
 async def jugar_command(update, context):
+    user_id = update.effective_user.id
+    db.update_activity(user_id)
+    state = db.get_user_state(user_id)
+    if state["mode"] == "meta":
+        await _send_signal(user_id, update.message.chat_id, 3, context=context)
+        return
     text = "🎮 *Nueva señal de Mines*\n\nElige el número de minas del tablero (1-24):"
     await update.message.reply_text(text, reply_markup=_mines_keyboard(), parse_mode="Markdown")
 
@@ -193,6 +202,7 @@ async def reset_command(update, context):
 async def menu_button(update, context):
     handlers_map = {
         "🎮 Jugar": jugar_command,
+        "🎯 Meta": meta_command,
         "🔬 Simular": simular_command,
         "📊 Stats": stats_command,
         "🧹 Reset": reset_command,
@@ -205,12 +215,33 @@ async def menu_button(update, context):
         await handler(update, context)
 
 
+async def meta_command(update, context):
+    user_id = update.effective_user.id
+    db.update_activity(user_id)
+    META_AWAITING_BANK.add(user_id)
+    await update.message.reply_text(
+        "🎯 *Modo Meta*\n\n"
+        "¿Cuánto tienes de **bank**? (ej: 100000)\n\n"
+        "El bot usará **siempre 3 minas** y te dirá cuánto apostar "
+        "hasta llegar a tu meta.",
+        parse_mode="Markdown",
+        reply_markup=_main_menu_keyboard(),
+    )
+
+
 async def stake_command(update, context):
     user_id = update.effective_user.id
+    db.update_activity(user_id)
     bank = db.get_bank(user_id)
-    results = db.get_results(user_id)
+    _, session_start = db.update_activity(user_id)
+    session_results = db.get_results_since(user_id, session_start)
+    text = stake.status_line(session_results, bank)
+    state = db.get_user_state(user_id)
+    if state["mode"] == "meta" and state["meta_target"]:
+        pct = min(100, round((bank or 0) / state["meta_target"] * 100))
+        text += f"\n🎯 Meta activa: **${state['meta_target']:,}** · Bank: **${bank or 0:,}** ({pct}%)"
     await update.message.reply_text(
-        stake.status_line(results, bank),
+        text,
         parse_mode="Markdown",
         reply_markup=_main_menu_keyboard(),
     )
@@ -250,6 +281,51 @@ async def backup_command(update, context):
 async def text_handler(update, context):
     user_id = update.effective_user.id
     text = update.message.text
+
+    if user_id in META_AWAITING_BANK:
+        digits = "".join(ch for ch in text if ch.isdigit())
+        bank_tmp = int(digits) if digits else 0
+        if bank_tmp < stake.MIN_BET:
+            await update.message.reply_text(
+                f"El bank debe ser al menos **${stake.MIN_BET:,} COP**. Escribe el monto:",
+                parse_mode="Markdown",
+            )
+            return
+        META_AWAITING_BANK.discard(user_id)
+        META_BANK_TMP[user_id] = bank_tmp
+        META_AWAITING_TARGET.add(user_id)
+        await update.message.reply_text(
+            f"🏦 Bank: **${bank_tmp:,}**\n\n"
+            f"🎯 ¿A cuánto quieres **llegar**? (meta mayor que tu bank, ej: 300000)",
+            parse_mode="Markdown",
+        )
+        return
+
+    if user_id in META_AWAITING_TARGET:
+        digits = "".join(ch for ch in text if ch.isdigit())
+        bank_tmp = META_BANK_TMP.get(user_id)
+        if not digits or (bank_tmp and int(digits) <= bank_tmp):
+            await update.message.reply_text(
+                "La meta debe ser **mayor** que tu bank actual. Escribe el monto objetivo:",
+                parse_mode="Markdown",
+            )
+            return
+        target = int(digits)
+        META_AWAITING_TARGET.discard(user_id)
+        META_BANK_TMP.pop(user_id, None)
+        db.set_bank(user_id, bank_tmp)
+        db.set_meta(user_id, bank_tmp, target)
+        db.update_activity(user_id)
+        await update.message.reply_text(
+            f"🎯 *Meta activada!*\n\n"
+            f"Bank: **${bank_tmp:,}**\n"
+            f"Objetivo: **${target:,}**\n\n"
+            f"Jugaremos **siempre con 3 minas**. Pulsa 🎮 Jugar para la siguiente señal.",
+            parse_mode="Markdown",
+            reply_markup=_main_menu_keyboard(),
+        )
+        return
+
     if user_id in BANK_AWAITING:
         BANK_AWAITING.discard(user_id)
         digits = "".join(ch for ch in text if ch.isdigit())
@@ -279,7 +355,7 @@ async def on_callback(update, context):
 
     if data.startswith("mines:"):
         mines = int(data.split(":")[1])
-        await _send_signal(q.from_user.id, q.message.chat_id, mines, q=q)
+        await _send_signal(q.from_user.id, q.message.chat_id, mines, context, q=q)
     elif data == "result:won":
         await _report_result(q, True)
     elif data == "result:lost":
@@ -312,11 +388,17 @@ async def on_callback(update, context):
         mask = int(data[len("bomb:"):] or 0)
         await q.edit_message_reply_markup(reply_markup=_bomb_keyboard(mask))
     elif data == "jugar":
-        await q.edit_message_text(
-            "🎮 *Nueva señal de Mines*\n\nElige el número de minas (1-24):",
-            reply_markup=_mines_keyboard(),
-            parse_mode="Markdown",
-        )
+        user_id = q.from_user.id
+        db.update_activity(user_id)
+        state = db.get_user_state(user_id)
+        if state["mode"] == "meta":
+            await _send_signal(user_id, q.message.chat_id, 3, context, q=q)
+        else:
+            await q.edit_message_text(
+                "🎮 *Nueva señal de Mines*\n\nElige el número de minas (1-24):",
+                reply_markup=_mines_keyboard(),
+                parse_mode="Markdown",
+            )
     elif data == "stats":
         await _show_stats(q.message.chat_id, q, None)
     elif data == "reset_confirm":
@@ -328,18 +410,28 @@ async def on_callback(update, context):
         await q.edit_message_text("❌ Operación cancelada.")
 
 
-async def _send_signal(user_id, chat_id, mines, q=None):
+async def _send_signal(user_id, chat_id, mines, context, q=None):
+    new_session, session_start = db.update_activity(user_id)
+    state = db.get_user_state(user_id)
+    if state["mode"] == "meta":
+        mines = 3
     cells = signals.generate_signal(user_id, mines)
     bank = db.get_bank(user_id)
-    results = db.get_results(user_id)
-    bet, _ = stake.recommend_bet(results, bank)
+    session_results = db.get_results_since(user_id, session_start)
+    bet, session = stake.recommend_bet(session_results, bank)
     db.create_game(user_id, mines, cells, bet)
     grid = signals.render_grid(cells)
     text = f"🎯 Señal · {mines} trampas\n\n{grid}\n\n💰 Apuesta: ${bet:,}"
+    if state["mode"] == "meta" and state["meta_target"]:
+        pct = min(100, round((bank or 0) / state["meta_target"] * 100))
+        text += f"\n🎯 Meta: ${state['meta_target']:,} · Bank: ${bank or 0:,} ({pct}%)"
+    if new_session:
+        text += "\n\n🔄 Nueva sesión: control reiniciado desde $400."
     if q:
-        await q.edit_message_text(text, reply_markup=_result_keyboard(), parse_mode="Markdown")
+        await q.edit_message_text(text, reply_markup=_result_keyboard())
     else:
-        await context.bot.send_message(chat_id, text, reply_markup=_result_keyboard(), parse_mode="Markdown")
+        kb = _result_keyboard()
+        await context.bot.send_message(chat_id, text, reply_markup=kb)
 
 
 async def _report_result(q, won):
@@ -361,7 +453,9 @@ async def _report_result(q, won):
 
     bank = db.get_bank(user_id)
     bank_val = bank if bank is not None else 0
-    next_bet, state = stake.recommend_bet(db.get_results(user_id), bank)
+    _, session_start = db.update_activity(user_id)
+    session_results = db.get_results_since(user_id, session_start)
+    next_bet, state = stake.recommend_bet(session_results, bank)
     stats = db.get_user_stats(user_id)
     rate = stats["wins"] / stats["games"] * 100 if stats["games"] else 0
     profit = round(stake_amount * (mult - 1)) if won else -stake_amount
@@ -374,6 +468,14 @@ async def _report_result(q, won):
         + f"\n📈 {state} · Próxima apuesta: ${next_bet:,}\n"
         f"📊 {stats['games']}P · {stats['wins']}G · {stats['losses']}P · {rate:.1f}%"
     )
+    user_state = db.get_user_state(user_id)
+    if user_state["mode"] == "meta" and user_state["meta_target"]:
+        target = user_state["meta_target"]
+        pct = min(100, round(bank_val / target * 100))
+        text += f"\n🎯 Meta: ${target:,} · Bank: ${bank_val:,} ({pct}%)"
+        if bank_val >= target:
+            db.clear_meta(user_id)
+            text += "\n\n🎉 *¡Meta alcanzada!* Regresaste al modo normal. Muy bien 💪"
     kb = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🔁 Nueva señal", callback_data="jugar")],

@@ -10,6 +10,7 @@ from handlers import (
     bank_command,
     help_command,
     jugar_command,
+    meta_command,
     on_callback,
     reset_command,
     simular_command,
@@ -63,6 +64,7 @@ MENU_COMMANDS = [
     BotCommand("simular", "Analizar 100,000 rondas"),
     BotCommand("stake", "Ver apuesta recomendada"),
     BotCommand("bank", "Registrar tu bank (ej. /bank 100000)"),
+    BotCommand("meta", "Modo meta: fija bank y objetivo"),
     BotCommand("stats", "Ver tus estadísticas"),
     BotCommand("backup", "Descargar copia de la base de datos"),
     BotCommand("reset", "Borrar historial"),
@@ -91,6 +93,7 @@ def main():
     app.add_handler(CommandHandler("simular", simular_command))
     app.add_handler(CommandHandler("stake", stake_command))
     app.add_handler(CommandHandler("bank", bank_command))
+    app.add_handler(CommandHandler("meta", meta_command))
     app.add_handler(CommandHandler("backup", backup_command))
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
